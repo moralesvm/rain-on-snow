@@ -6,6 +6,9 @@ import s3fs
 from rasterio import features
 import pyproj
 import geopandas
+import exactextract
+from exactextract import exact_extract
+from shapely.geometry import box
 #import rioxarray
 
 # --- CONSTANTS ---
@@ -101,97 +104,63 @@ def get_ros_basins(ros_zone,shpPath):
     # Reproject basins to NWM projection
     shp_prj = shp.to_crs(nwm_proj.crs)
 
-    # Create a lookup table for later: {index: GAGE_ID}
-    lookup = shp_prj['GAGE_ID'].to_dict()
+    # Select basins within the domain
+    #---------------------------------
+    # Get raster bounds
+    raster_bounds = box(*ros_zone.rio.bounds())
+    # Filter polygons intersecting raster
+    shp_prj_subset = shp_prj[shp_prj.intersects(raster_bounds)]
 
-    # Rasterize shp polygons
-    #-------------------------
-    # This will make it easier to mask later
-    # Create a list of (geometry, identifier) tuples
-    shapes = zip(shp_prj.geometry, shp_prj.index)
+    # Extract % of ROS zone per basin
+    #---------------------------------
+    #ros_zone_bsns_df = exact_extract(ros_zone, shp_prj_subset, ['sum','count','mean'], # For testing
+    ros_zone_bsns_df = exact_extract(ros_zone, shp_prj_subset, ['mean'],
+                                     include_cols='GAGE_ID', output='pandas')
 
-    # Create a manual mask aligned with the Xarray coordinates
-    mask = features.rasterize(
-        shapes=shapes,
-        out_shape=(ros_zone.rio.height, ros_zone.rio.width),
-        transform=ros_zone.rio.transform(),
-        fill=-1, # Areas outside any polygon
-        all_touched=False)
+    ros_zone_bsns_df['Perc_ROS'] = (ros_zone_bsns_df['mean'] * 100).round(0)
+    ros_zone_bsns_df.drop(columns=['mean'], inplace=True)
 
-    # Add the mask into to ROS zone Xarray for easy grouping
-    #--------------------------------------------------------
-    ros_zone_mask_wBsns = ros_zone
-    ros_zone_mask_wBsns["bsn_mask"] = (("y", "x"), mask)
+    return ros_zone_bsns_df
 
-    # Now let's get the % of ROS grid cells within each basin for the ROS zone
-    #--------------------------------------------------------------------------
-    # Thet's ignode cells outside the basins
-    valid_pixels = ros_zone_mask_wBsns.where(ros_zone_mask_wBsns.bsn_mask != -1)
+def get_ros_events(ros_daily_mask,shpPath,t_chunks):
 
-    def compute_stats(group):
-        total_cells = group.count()
-        ones_count = (group == 1).sum()
-        percentage = (ones_count / total_cells) * 100
+    # Read basins shapefile
+    #----------------------
+    shp = geopandas.read_file(shpPath)
+    # Reproject basins to NWM projection
+    shp_prj = shp.to_crs(nwm_proj.crs)
 
-        return percentage
+    # Select basins within the domain
+    #---------------------------------
+    # Get raster bounds
+    raster_bounds = box(*ros_daily_mask.rio.bounds())
+    # Filter polygons intersecting raster
+    shp_prj_subset = shp_prj[shp_prj.intersects(raster_bounds)]
 
-    # Apply the calculation across the masked groups
-    results = valid_pixels.groupby("bsn_mask").apply(compute_stats)
+    # Let's re-chunk the ros daily dataset for faster processing
+    #------------------------------------------------------------
+    ros_daily_mask = ros_daily_mask.chunk({'time': t_chunks, 'x': -1, 'y': -1}).persist()
 
-    # Turn % into easy to read table
-    #--------------------------------
-    results_df = results.compute().to_dataframe(name='percentage')
-    # Filter out the background mask
-    results_df = results_df[results_df.index != -1]
-    results_df['GAGE_ID'] = results_df.index.map(lookup)
+    # Process % of ros per day and basin
+    #-----------------------------------
+    df_ros_evs = exact_extract(ros_daily_mask, shp_prj_subset, ['mean'],include_cols='GAGE_ID',
+                               output='pandas',strategy='raster-sequential')
 
-    return results_df, mask, lookup
+    # Create a mapping dictionary: band_index = Date
+    date_map = {f"band_{i+1}_mean": d for i, d in enumerate(ros_daily_mask.time.values)}
 
-def get_ros_events(ros_daily_mask,shpRaster, lookupTable):
+    # Reshape the results (exactextract returns wide format for time)
+    daily_ros_evs = df_ros_evs.melt(id_vars='GAGE_ID', var_name='layer', value_name='mean_ros')
 
-    # Add the rasterized basins to the ros daily mask for easy grooping
-    #--------------------------------------------------------------------
-    mask = shpRaster
-    ros_mask_wBsns = ros_daily_mask
-    ros_mask_wBsns["bsn_mask"] = (("y", "x"), mask)
+    # Final Percentage calculation
+    daily_ros_evs['Perc_ROS'] = (daily_ros_evs['mean_ros'] * 100).round(1)
 
-    # Let's re-chunk this data for easy processing
-    ros_daily_mask = ros_daily_mask.chunk({'time': -1, 'x': 452, 'y': 500}) # HARDCODED, FIX LATER
+    # Add time to the final df and clean columns and order
+    daily_ros_evs['Date'] = daily_ros_evs['layer'].map(date_map)
+    daily_ros_evs.drop(['layer', 'mean_ros'], axis=1, inplace=True)
+    daily_ros_evs = daily_ros_evs[['GAGE_ID', 'Date', 'Perc_ROS']]
 
-    # Since the basins are always the same, and the grids too (same resolution.
-    # I'll use the first time slice to count total pixels per basin
-    # We filter out -1 (background) immediately
-    total_cells_static = ros_mask_wBsns["bsn_mask"].where(ros_mask_wBsns["bsn_mask"] != -1).groupby("bsn_mask").count().compute()
-
-    # Compute number of 1s (ROS grid-cell) and % per basin and per day
-    #---------------------------------------------------------------------
-    ones_count = ros_daily_mask.groupby(ros_mask_wBsns["bsn_mask"]).sum().compute()
-
-    # Let's filter computation of cells outside basins and get the percentage
-    ones_count = ones_count.sel(bsn_mask=ones_count.bsn_mask != -1)
-
-    # Combine everything in a single data frame
-    #-------------------------------------------
-    # Convert ones_count to a 'long' dataframe
-    df_final = ones_count.to_dataframe(name="ones_count").reset_index()
-
-    # Convert static denominator to a DF for easy merging
-    df_total = total_cells_static.to_dataframe(name="total_cells").reset_index()
-
-    # Merge the static basin info into the daily time series
-    df_final = df_final.merge(df_total, on="bsn_mask")
-
-    # Calculate the percentage column
-    df_final["percentage"] = (df_final["ones_count"] / df_final["total_cells"]) * 100
-
-    # Map the basin indices to your GAGE_IDs
-    df_final["GAGE_ID"] = df_final["bsn_mask"].map(lookupTable)
-
-    # Organize columns and sort for report
-    df_final = df_final[["GAGE_ID", "time", "ones_count", "total_cells", "percentage"]]
-    df_final = df_final.sort_values(["GAGE_ID", "time"])
-
-    return df_final
+    return daily_ros_evs
 
 
 
