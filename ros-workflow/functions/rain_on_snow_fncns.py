@@ -1,5 +1,6 @@
 import os
 import pandas as pd
+import numpy as np
 import xarray
 import s3fs
 #import rasterio
@@ -112,35 +113,38 @@ def daily_resampler(dataset):
 
 def ros_musselman(dataset):
 
-       # Convert units
-       #---------------
-       # NOTE:
-       # QRAIN = Rainfall rate on the ground (mm/s)
-       # SNEQV = Snowfall water equivalent (kg/m2)
-       # 1 kg/m² = 1 mm water equivalent
-       dataset["QRAIN_mm"] = dataset["QRAIN"] * 3 * 3600
-       dataset["QRAIN_mm"].attrs["units"] = "mm"
+    # Create a shallow copy so the original ds_ne is protected
+    ds = dataset.copy()
 
-       # Summarize to daily
-       #--------------------
-       rain_daily = dataset["QRAIN_mm"].resample(time="1D").sum()
-       sneqv_daily = dataset["SNEQV"].resample(time="1D").mean()
+    # Convert units
+    #---------------
+    # NOTE:
+    # QRAIN = Rainfall rate on the ground (mm/s)
+    # SNEQV = Snowfall water equivalent (kg/m2)
+    # 1 kg/m² = 1 mm water equivalent
+    dataset["QRAIN_mm"] = dataset["QRAIN"] * 3 * 3600
+    dataset["QRAIN_mm"].attrs["units"] = "mm"
 
-       # Combine them back to a single dataset to ease computations
-       ds_daily = xarray.Dataset({
-           "QRAIN_daily_mm": rain_daily,
-           "SNEQV_daily_mm": sneqv_daily})
+    # Summarize to daily
+    #--------------------
+    rain_daily = dataset["QRAIN_mm"].resample(time="1D").sum()
+    sneqv_daily = dataset["SNEQV"].resample(time="1D").mean()
 
-       # ROS condition - Binary flag per grid-cell
-       #--------------------------------------------
-       ros_daily_mask = ((ds_daily["QRAIN_daily_mm"] > 10) &
-                   (ds_daily["SNEQV_daily_mm"] > 10)).astype(int)
+    # Combine them back to a single dataset to ease computations
+    ds_daily = xarray.Dataset({
+        "QRAIN_daily_mm": rain_daily,
+        "SNEQV_daily_mm": sneqv_daily})
 
-       # Assign NWM projection
-       #------------------------
-       ros_daily_mask = ros_daily_mask.rio.write_crs(nwm_proj.crs)
+    # ROS condition - Binary flag per grid-cell
+    #--------------------------------------------
+    ros_daily_mask = ((ds_daily["QRAIN_daily_mm"] >= 10) &
+                      (ds_daily["SNEQV_daily_mm"] >= 10)).astype(int)
 
-       return ros_daily_mask
+    # Assign NWM projection
+    #------------------------
+    ros_daily_mask = ros_daily_mask.rio.write_crs(nwm_proj.crs)
+
+    return ros_daily_mask
 
 def define_ros_zone(daily_ros_mask, threshold):
 
@@ -169,7 +173,10 @@ def get_ros_basins(ros_zone,shp):
     ros_zone_bsns_df['Perc_ROS'] = (ros_zone_bsns_df['mean'] * 100).round(0)
     ros_zone_bsns_df.drop(columns=['mean'], inplace=True)
 
-    return ros_zone_bsns_df
+    # Filter only basins with ROS % > 0
+    fltr_ros_zone_bsns = ros_zone_bsns_df[ros_zone_bsns_df['Perc_ROS'] > 0.0].copy()
+
+    return fltr_ros_zone_bsns
 
 def get_ros_events(ros_daily_mask,shp):#,t_chunks):
 
@@ -196,7 +203,10 @@ def get_ros_events(ros_daily_mask,shp):#,t_chunks):
     daily_ros_evs.drop(['layer', 'mean_ros'], axis=1, inplace=True)
     daily_ros_evs = daily_ros_evs[['GAGE_ID', 'Date', 'Perc_ROS']]
 
-    return daily_ros_evs
+    # Filter only days with ROS % > 0
+    fltr_daily_ros_evs = daily_ros_evs[daily_ros_evs['Perc_ROS'] > 0.0]
+
+    return fltr_daily_ros_evs
 
 def batch_processor(ds, func, batch_size_years, **kwargs):
     """
@@ -223,7 +233,7 @@ def batch_processor(ds, func, batch_size_years, **kwargs):
 
     return pd.concat(all_results, ignore_index=True)
 
-def extract_hydrologic_properties(ds, events_df, shp):
+def extract_dly_hydrologic_properties(ds, events_df, shp):
 
     # 1. Get the dates present in this dataset
     ds_dates = ds.time.values
@@ -272,7 +282,69 @@ def extract_hydrologic_properties(ds, events_df, shp):
 
     return evs_prop
 
+def extract_hydrologic_properties(ds, events_df, shp):
 
+    # 1. Create a "Day" version of the times in the dataset
+    ds_times_full = ds.time.values
+    ds_days = ds.time.dt.floor("D").values  # Floored to YYYY-MM-DD 00:00
+
+    # 2. Filter the ROS events for ONLY the dates in this dataset
+    relevant_events = events_df[events_df['Date'].isin(ds_days)]
+
+    if relevant_events.empty:
+        return pd.DataFrame()
+
+    # 3. Filter the Dataset to ONLY these dates
+    active_dates_list = relevant_events['Date'].unique()
+    # Find every hourly timestamp that falls on each event days
+    time_mask = np.isin(ds_days, active_dates_list)
+    ds_subset = ds.sel(time=time_mask)
+
+    subset_times = ds_subset.time.values
+
+    # 4. Run exact_extract (mean values of the hydrologic variables)
+    # Only for the selected dates
+    df_wide = exact_extract(ds_subset, shp, ['mean'],
+                            include_cols='GAGE_ID', output='pandas')
+
+    # 5. Melt the wide dataframe
+    # This turns [GAGE_ID, temp_band_1_mean, precip_band_1_mean] into
+    # [GAGE_ID, column_name, value]
+    df_long = df_wide.melt(id_vars='GAGE_ID', var_name='column_name', value_name='value')
+
+    # 6. Parse the variable name and band number from the column name
+    # We split 'temp_band_1_mean' into ['temp', '1']
+    # We use regex or string splitting
+    parsed = df_long['column_name'].str.extract(r'^(.*)_band_(\d+)_mean$')
+    df_long['variable'] = parsed[0]
+    df_long['band_idx'] = parsed[1].astype(int) - 1 # Back to 0-indexed for Python
+
+    # 7. Map the Date using the band index
+    date_lookup = {i: d for i, d in enumerate(subset_times)}
+    df_long['DateTime'] = df_long['band_idx'].map(date_lookup)
+
+    # 8. Pivot back so each variable has its own column (Optional but cleaner)
+    # This gives you: [GAGE_ID, Date, temp, precip, etc]
+    df_final = df_long.pivot(index=['GAGE_ID', 'DateTime'],
+                             columns='variable',
+                             values='value').reset_index()
+
+    df_final.columns = [f"{col}_mean" if col not in ['GAGE_ID', 'DateTime'] else col for col in df_final.columns]
+
+    # Since our final df is hourly and events are in daily frequency, we create a temporary column
+    # to join both data frames
+    df_final['Date_Join'] = pd.to_datetime(df_final['DateTime']).dt.floor('D')
+
+    # 9. Inner Join with your ROS events
+    evs_prop = pd.merge(relevant_events, df_final,
+                        left_on=['GAGE_ID', 'Date'],
+                        right_on=['GAGE_ID', 'Date_Join'],
+                        how='inner')
+
+    # Drop the temporary join key
+    evs_prop.drop(columns=['Date_Join'], inplace=True)
+
+    return evs_prop
 
 
 
