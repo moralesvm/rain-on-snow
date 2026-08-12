@@ -1,5 +1,6 @@
 import os
 import gc
+import glob
 import time
 from pathlib import Path
 import pandas as pd
@@ -67,7 +68,7 @@ def read_nwmData(awsPath, variables, timerange, x_range=None, y_range=None):
     ds = ds.rio.write_coordinate_system()
 
     # Build the spatial slices from the resolved ranges; a None bound falls back
-    # to the data edge. NWM x and y are both ascending, so slices run low -> high.
+    # to the data edge. NWM x and y are both ascending, so slices run low to high.
     x0 = ds["x"].min().item() if x_range[0] is None else x_range[0]
     x1 = ds["x"].max().item() if x_range[1] is None else x_range[1]
     y0 = ds["y"].min().item() if y_range[0] is None else y_range[0]
@@ -107,6 +108,98 @@ def prepare_spatial_assets(ds, shp_path):
     print(f"Automatic Setup Complete: {len(shp_prj_subset)} basins selected.")
 
     return shp_prj_subset
+
+def load_conus_basins(shp_dir, metadata_path, bsn_class=('ref', 'nonref')):
+    """
+    Loads GAGES II basin polygons for the conterminous (conus) US, reprojects to NWM LCC,
+    and attaches each basin's HUC2 region via an inner join with the CONUS metadata.
+
+    The metadata (built from the conus GAGES II tables) is the main
+    source of basin HUC2 data: the inner join keeps only basins present in
+    the metadata, which also drops the AK/HI/PR reference basins carried inside
+    bas_ref_all.shp (their GAGE_IDs are absent from the conus metadata).
+
+    Args:
+        shp_dir: Directory holding the GAGES II 'boundaries-shapefiles-by-aggeco'
+                 polygons (bas_ref_all.shp and bas_nonref_<ecoregion>.shp).
+        metadata_path: Path to Metadata_GAGESII_ROS.parquet (columns GAGE_ID, HUC02, CLASS, ...).
+        bsn_class: Which basin classes to load: 'ref' (bas_ref_all.shp) and/or 'nonref'
+                 (all bas_nonref_*.shp ecoregion files except the AKHIPR ecoregion).
+
+    Returns:
+        geopandas.GeoDataFrame in NWM LCC with columns ['GAGE_ID', 'HUC02', 'CLASS',
+        'geometry']. GAGE_ID is normalized to the zero-padded string form used by the
+        metadata; CLASS is normalized to 'ref' / 'nonref'.
+    """
+    shp_dir = os.path.join(str(shp_dir), '')  # ensure a trailing separator
+
+    frames = []
+    if 'ref' in bsn_class:
+        frames.append(geopandas.read_file(shp_dir + 'bas_ref_all.shp')[['GAGE_ID', 'geometry']])
+    if 'nonref' in bsn_class:
+        # All non-reference ecoregion files except AKHIPR (Alaska/Hawaii/Puerto Rico).
+        nonref_files = sorted(f for f in glob.glob(shp_dir + 'bas_nonref_*.shp')
+                              if 'AKHIPR' not in os.path.basename(f))
+        frames.extend(geopandas.read_file(f)[['GAGE_ID', 'geometry']] for f in nonref_files)
+
+    basins = pd.concat(frames, ignore_index=True)
+    basins = geopandas.GeoDataFrame(basins, geometry='geometry', crs=frames[0].crs)
+
+    # Shapefile GAGE_ID is stored as a float64 (leading zeros lost). Normalize to the
+    # zero-padded string form (>= 8 chars) used by the GAGES II metadata so join keys match.
+    basins['GAGE_ID'] = basins['GAGE_ID'].astype('int64').astype(str).str.zfill(8)
+
+    # Reproject basins to NWM projection
+    basins = basins.to_crs(nwm_proj.crs)
+
+    # Attach HUC2 (and CLASS) from the main CONUS metadata; the inner join drops
+    # polygons with no metadata row (AK/HI/PR and any unmatched IDs).
+    meta = pd.read_parquet(metadata_path, columns=['GAGE_ID', 'HUC02', 'CLASS'])
+    meta = meta.assign(GAGE_ID=meta['GAGE_ID'].astype(str))
+    basins = basins.merge(meta, on='GAGE_ID', how='inner')
+
+    # Normalize CLASS to the 'ref' / 'nonref' tags used for subsetting and output naming.
+    basins['CLASS'] = basins['CLASS'].map({'Ref': 'ref', 'Non-ref': 'nonref'})
+
+    print(f"Loaded {len(basins)} basins across {basins['HUC02'].nunique()} HUC2 regions.")
+    return basins
+
+def huc2_basins(basins_gdf, huc2):
+    """
+    Returns the subset of basins assigned to a single HUC2 region.
+
+    Args:
+        basins_gdf: GeoDataFrame from load_conus_basins (must have a 'HUC02' column).
+        huc2: HUC2 region code as a string (e.g., '01', '10L', '10U').
+
+    Returns:
+        geopandas.GeoDataFrame: basins whose HUC02 equals huc2.
+    """
+
+    basin_subset = basins_gdf[basins_gdf['HUC02'] == huc2].copy()
+
+    return basin_subset
+
+def huc2_domain_bounds(basins_subset, pad=5000.0):
+    """
+    Computes the NWM LCC x/y ranges that fully enclose a set of basin polygons,
+    padded outward so the domain crop never slices a basin and exactextract keeps
+    full coverage at the edge cells.
+
+    Args:
+        basins_subset: GeoDataFrame of basins in NWM LCC (e.g., from huc2_basins).
+        pad: Outward padding in NWM LCC meters (default 5000 m ~ a few ~1 km NWM cells).
+
+    Returns:
+        (x_range, y_range): two (min, max) tuples in NWM LCC meters, ready to pass to
+        read_nwmData(..., x_range=x_range, y_range=y_range).
+    """
+    if len(basins_subset) == 0:
+        raise ValueError("basins_subset is empty; no domain bounds to compute.")
+    minx, miny, maxx, maxy = basins_subset.total_bounds
+    x_range = (minx - pad, maxx + pad)
+    y_range = (miny - pad, maxy + pad)
+    return x_range, y_range
 
 def daily_resampler(dataset):
     """
@@ -161,74 +254,144 @@ def daily_resampler(dataset):
 
 def ros_musselman(dataset):
     """
-    Applies the Musselman ROS detection method to produce a daily binary mask.
+    Applies the Musselman ROS detection method to produce daily binary masks.
+
     A grid cell is flagged as ROS when daily QRAIN >= 10 mm AND daily SNEQV >= 10 mm.
+    The two component masks ('mask_rain', 'mask_sneqv') record each threshold on its
+    own, so downstream extraction can report the % of a basin meeting the rain
+    condition and the snowpack condition separately, in addition to the combined ROS %.
 
     Args:
         dataset: xarray.Dataset containing 'QRAIN' (mm/s) and 'SNEQV' (kg/m²) variables
                  with a sub-daily time dimension and NWM LCC CRS.
 
     Returns:
-        xarray.DataArray: Daily binary ROS mask (1 = ROS, 0 = no ROS) with NWM LCC CRS.
+        xarray.Dataset: Daily binary masks (1 = condition met, 0 = not met) with NWM
+        LCC CRS:
+          * 'mask_ros'   - QRAIN_daily >= 10 mm AND SNEQV_daily >= 10 mm (combined ROS)
+          * 'mask_rain'  - QRAIN_daily >= 10 mm
+          * 'mask_sneqv' - SNEQV_daily >= 10 mm
     """
-    # NOTE: We operate on `dataset` directly below. This only adds a derived
-    # 'QRAIN_mm' variable to the dataset; the existing QRAIN/SNEQV data
-    # is never modified. If no modification on dataset is ever needed, work on a copy:
-    # ds = dataset.copy()
+    # Work on a copy so the derived 'QRAIN_mm' is not added to the caller's dataset.
+    ds = dataset.copy()
 
     # Convert units
     # NOTE:
     # QRAIN = Rainfall rate on the ground (mm/s)
     # SNEQV = Snowfall water equivalent (kg/m2)
     # 1 kg/m² = 1 mm water equivalent
-    dataset["QRAIN_mm"] = dataset["QRAIN"] * 3 * 3600
-    dataset["QRAIN_mm"].attrs["units"] = "mm"
+    ds["QRAIN_mm"] = ds["QRAIN"] * 3 * 3600
+    ds["QRAIN_mm"].attrs["units"] = "mm"
 
     # Summarize to daily
-    rain_daily = dataset["QRAIN_mm"].resample(time="1D").sum()
-    sneqv_daily = dataset["SNEQV"].resample(time="1D").mean()
+    rain_daily = ds["QRAIN_mm"].resample(time="1D").sum()
+    sneqv_daily = ds["SNEQV"].resample(time="1D").mean()
 
     # Combine them back to a single dataset to ease computations
     ds_daily = xarray.Dataset({
         "QRAIN_daily_mm": rain_daily,
         "SNEQV_daily_mm": sneqv_daily})
 
-    # ROS condition - Binary flag per grid-cell
-    ros_daily_mask = ((ds_daily["QRAIN_daily_mm"] >= 10) &
-                      (ds_daily["SNEQV_daily_mm"] >= 10)).astype(int)
+    # Component conditions - Binary flag per grid-cell.
+    # int8 (not the default int64): a 0/1 mask needs only 1 byte, which keeps the
+    # three-mask daily stack 8x smaller in memory when batch_processor materializes a
+    # multi-year subset for get_ros_events. exactextract's coverage-weighted mean is
+    # identical for int8 vs int64 inputs.
+    rain_mask = (ds_daily["QRAIN_daily_mm"] >= 10).astype("int8")
+    sneqv_mask = (ds_daily["SNEQV_daily_mm"] >= 10).astype("int8")
 
-    # Assign NWM projection
-    ros_daily_mask = ros_daily_mask.rio.write_crs(nwm_proj.crs)
+    # ROS condition - both met simultaneously
+    ros_mask = (rain_mask & sneqv_mask).astype("int8")
 
-    return ros_daily_mask
+    # Pack the three masks into one dataset and assign NWM projection
+    masks = xarray.Dataset({
+        "mask_ros": ros_mask,
+        "mask_rain": rain_mask,
+        "mask_sneqv": sneqv_mask})
+    masks = masks.rio.write_crs(nwm_proj.crs)
+
+    return masks
 
 def define_ros_zone(daily_ros_mask, threshold):
     """
-    Identifies the ROS zone as grid cells where at least one ROS day per year
-    occurs across a minimum number of years equal to the threshold.
+    Identifies the ROS zone as grid cells that have at least one ROS day in every
+    water year of the record (i.e. >=1 ROS day per year on a presence basis).
+
+    Years are grouped by water year (Oct 1 - Sep 30) rather than calendar year,
+    because the snow season crosses the Jan 1 boundary; calendar grouping would
+    split each season in two and turn the partial first/last windows into spurious
+    full years. For the full 1979-10 -> 2022-09 slice this yields 43 water years.
 
     Args:
         daily_ros_mask: xarray.DataArray with a daily binary ROS flag (from ros_musselman)
-                        and a 'time' dimension spanning multiple years.
-        threshold: Minimum number of years in which a cell must have at least one
-                   ROS day to be included in the zone (e.g., 43 for the full 1979-2022 period).
+                        and a 'time' dimension spanning multiple water years.
+        threshold: Minimum number of water years in which a cell must have at least
+                   one ROS day to be included in the zone. Pass the number of water
+                   years in the record (43 for the full 1979-2022 slice) to require a
+                   ROS day in every water year; pass a smaller int to relax the rule
+                   (e.g. 40 of 43 years). Must not exceed the water years available.
 
     Returns:
         xarray.DataArray: Binary ROS zone mask (1 = in zone, 0 = outside) with NWM LCC CRS.
     """
-    # ROS zone:
-    # All grid cells that have at least 1 ROS day in each of `threshold` years.
-    # Example: with threshold=43, a grid cell must have >=1 ROS day in 43 distinct
-    # years to be included in the ROS zone (43 of the full NWM v3 retrospective
-    # period, 1979-2022).
+    # Water year
+    t = daily_ros_mask['time']
+    water_year = (t.dt.year + (t.dt.month >= 10).astype(int)).rename('water_year')
 
-    yearly_presence = daily_ros_mask.groupby('time.year').any(dim='time').compute() # At least 1 ROS day per year
-    ros_zone_mask = (yearly_presence.sum(dim='year') == threshold).astype(int)
+    # Per cell, per water year: did at least one ROS day occur?
+    yearly_presence = daily_ros_mask.groupby(water_year).any(dim='time').compute()
+    # A threshold above the water years available can never be met, so the zone would come
+    # back empty rather than wrong, and easy to mistake for "no ROS anywhere".
+    # Callers hardcode the record length (N_YEARS = 43), so we can catch the mismatch here.
+    n_years = yearly_presence.sizes['water_year']
+    if threshold > n_years:
+        raise ValueError(f"threshold={threshold} exceeds the {n_years} water years in the record")
+
+    # Count the water years with >=1 ROS day and keep cells meeting the threshold.
+    ros_zone_mask = (yearly_presence.sum(dim='water_year') >= threshold).astype('int32')
 
     # Assign NWM projection
     ros_zone_mask = ros_zone_mask.rio.write_crs(nwm_proj.crs)
 
     return ros_zone_mask
+
+def count_ros_days(daily_ros_mask):
+    """
+    Counts ROS days per grid cell, by water year and over the whole record.
+
+    Water years are Oct 1 - Sep 30 (see define_ros_zone for why calendar years would
+    split the snow season). The total is the sum over water years, which is identical
+    to summing over time but reuses the single compute already done here.
+
+    Args:
+        daily_ros_mask: xarray.DataArray with a daily binary ROS flag (from ros_musselman)
+                        and a 'time' dimension spanning multiple water years.
+
+    Returns:
+        xarray.Dataset with NWM LCC CRS and two variables:
+            ros_days_wy    (water_year, y, x): ROS days in each water year
+            ros_days_total (y, x):             ROS days over the whole record
+    """
+    # A water year holds at most 366 ROS days, so int16 is the smallest safe width;
+    # it also halves the on-disk size relative to the int32 zone rasters.
+    count_dtype = 'int16'
+
+    # Water year
+    t = daily_ros_mask['time']
+    water_year = (t.dt.year + (t.dt.month >= 10).astype(int)).rename('water_year')
+
+    # Per cell, per water year: how many ROS days occurred? The int8 mask promotes to
+    # int64 under the sum, so there is no overflow before the cast back down.
+    yearly_counts = daily_ros_mask.groupby(water_year).sum(dim='time')
+    yearly_counts = yearly_counts.astype(count_dtype).compute()
+    total_counts = yearly_counts.sum(dim='water_year').astype(count_dtype)
+
+    counts = xarray.Dataset({'ros_days_wy': yearly_counts, 'ros_days_total': total_counts})
+
+    # Assign NWM projection
+    counts = counts.rio.write_crs(nwm_proj.crs)
+
+    return counts
 
 def get_ros_basins(ros_zone, shp):
     """
@@ -243,13 +406,16 @@ def get_ros_basins(ros_zone, shp):
 
     Returns:
         pd.DataFrame: Columns ['GAGE_ID', 'Perc_ROS'] for basins with Perc_ROS > 0.
+        Perc_ROS is rounded to 1 decimal, and the filter is applied at that precision:
+        a basin covering less than 0.05% of the ROS zone is excluded rather than
+        reported as being in the zone at 0.0%.
     """
     # Extract % of ROS zone per basin
     #ros_zone_bsns_df = exact_extract(ros_zone, shp, ['sum','count','mean'], # For testing
     ros_zone_bsns_df = exact_extract(ros_zone, shp, ['mean'],
                                      include_cols='GAGE_ID', output='pandas')
 
-    ros_zone_bsns_df['Perc_ROS'] = (ros_zone_bsns_df['mean'] * 100).round(0)
+    ros_zone_bsns_df['Perc_ROS'] = (ros_zone_bsns_df['mean'] * 100).round(1)
     ros_zone_bsns_df.drop(columns=['mean'], inplace=True)
 
     # Filter only basins with ROS % > 0
@@ -257,46 +423,72 @@ def get_ros_basins(ros_zone, shp):
 
     return fltr_ros_zone_bsns
 
-def get_ros_events(ros_daily_mask, shp):
+def get_ros_events(masks_dataset, shp):
     """
-    Extracts daily ROS coverage per basin over the full time period and returns
-    only days where at least one basin has non-zero ROS coverage.
+    Extracts daily basin coverage of the ROS mask and its two component masks
+    (heavy rain, snowpack) over the full time period, and returns only the ROS
+    event-days (days where at least one basin has non-zero ROS coverage).
+
+    All three masks share the same grid, so they are extracted in a single
+    exactextract pass: the per-basin pixel-coverage is computed once and reused
+    across the three variables. The 'Perc_ROS' column is therefore numerically
+    identical to extracting the ROS mask on its own.
 
     Args:
-        ros_daily_mask: xarray.DataArray daily binary ROS mask (from ros_musselman)
-                        in NWM LCC projection, with a 'time' dimension.
+        masks_dataset: xarray.Dataset with daily binary 'mask_ros', 'mask_rain' and
+                       'mask_sneqv' (from ros_musselman) in NWM LCC projection, with
+                       a 'time' dimension.
         shp: geopandas.GeoDataFrame of basin polygons in NWM LCC projection
              with a 'GAGE_ID' column.
 
     Returns:
-        pd.DataFrame: Columns ['GAGE_ID', 'Date', 'Perc_ROS'] for basin-days with
-        Perc_ROS > 0.
+        pd.DataFrame: Columns ['GAGE_ID', 'Date', 'Perc_ROS', 'Perc_Rain', 'Perc_SWE']
+        for basin-days with Perc_ROS > 0. Perc_Rain / Perc_SWE are the % of the basin
+        meeting the daily rain >= 10 mm and SNEQV >= 10 mm thresholds on that day, and
+        are always >= Perc_ROS (ROS requires both conditions at once). All three are
+        rounded to 1 decimal, and the filter is applied at that precision: a basin-day
+        covering less than 0.05% of the basin is excluded rather than reported as a ROS
+        day at 0.0%.
     """
-    # Let's re-chunk the ros daily dataset for faster processing
-    #ros_daily_mask = ros_daily_mask.chunk({'time': t_chunks, 'x': -1, 'y': -1})#.persist()
+    # Single exactextract pass over the three masks. exactextract names the columns
+    # '<var>_band_<n>_mean' (or '<var>_mean' when there is only one timestep).
+    df_evs = exact_extract(masks_dataset, shp, ['mean'], include_cols='GAGE_ID',
+                           output='pandas', strategy='raster-sequential')
 
-    # Process % of ros per day and basin
-    df_ros_evs = exact_extract(ros_daily_mask, shp, ['mean'],include_cols='GAGE_ID',
-                               output='pandas',strategy='raster-sequential')
+    times = masks_dataset.time.values
+    single_step = len(times) == 1
 
-    # Create a mapping dictionary: band_index = Date
-    date_map = {f"band_{i+1}_mean": d for i, d in enumerate(ros_daily_mask.time.values)}
+    # Each mask -> its output percentage column
+    var_mapping = {
+        'mask_ros': 'Perc_ROS',
+        'mask_rain': 'Perc_Rain',
+        'mask_sneqv': 'Perc_SWE',
+    }
 
-    # Reshape the results (exactextract returns wide format for time)
-    daily_ros_evs = df_ros_evs.melt(id_vars='GAGE_ID', var_name='layer', value_name='mean_ros')
+    extracted = []
+    for var_name, col_name in var_mapping.items():
+        # Map this variable's wide time columns back to dates
+        if single_step:
+            date_map = {f"{var_name}_mean": times[0]}
+        else:
+            date_map = {f"{var_name}_band_{i+1}_mean": d for i, d in enumerate(times)}
 
-    # Final Percentage calculation
-    daily_ros_evs['Perc_ROS'] = (daily_ros_evs['mean_ros'] * 100).round(1)
+        sub = df_evs[['GAGE_ID'] + list(date_map.keys())]
+        long = sub.melt(id_vars='GAGE_ID', var_name='layer', value_name='mean_val')
 
-    # Add time to the final df and clean columns and order
-    daily_ros_evs['Date'] = daily_ros_evs['layer'].map(date_map)
-    daily_ros_evs.drop(['layer', 'mean_ros'], axis=1, inplace=True)
-    daily_ros_evs = daily_ros_evs[['GAGE_ID', 'Date', 'Perc_ROS']]
+        long[col_name] = (long['mean_val'] * 100).round(1)
+        long['Date'] = long['layer'].map(date_map)
+        long = long[['GAGE_ID', 'Date', col_name]].set_index(['GAGE_ID', 'Date'])
+        extracted.append(long)
 
-    # Filter only days with ROS % > 0
-    fltr_daily_ros_evs = daily_ros_evs[daily_ros_evs['Perc_ROS'] > 0.0]
+    # Join the three percentage columns on their shared (GAGE_ID, Date) index
+    daily_evs = pd.concat(extracted, axis=1).reset_index()
+    daily_evs = daily_evs[['GAGE_ID', 'Date', 'Perc_ROS', 'Perc_Rain', 'Perc_SWE']]
 
-    return fltr_daily_ros_evs
+    # Filter only ROS event-days (at least one basin with ROS % > 0)
+    fltr_daily_evs = daily_evs[daily_evs['Perc_ROS'] > 0.0].copy()
+
+    return fltr_daily_evs
 
 def add_water_year(df, date_col='Date'):
     """
@@ -339,18 +531,36 @@ def batch_processor(ds, func, batch_size_years, **kwargs):
     all_results = []
     years = sorted(ds.time.dt.year.to_series().unique())
 
+    # Accumulate the two cost centers so a run shows whether the S3 read or the
+    # exact_extract pass dominates (see the get_ros_events timing investigation).
+    total_compute = 0.0
+    total_extract = 0.0
+
     for i in range(0, len(years), batch_size_years):
         batch_years = years[i : i + batch_size_years]
-        print(f"--- Processing {batch_years[0]} to {batch_years[-1]} ---")
 
         # Slice and Compute to get a dataset that exact_extract can digest immediately.
+        # Timed separately: this is the S3 read + daily-mask derivation.
+        t0 = time.perf_counter()
         subset = ds.sel(time=ds.time.dt.year.isin(batch_years)).compute()
+        compute_s = time.perf_counter() - t0
 
-        # Run the specific function passed as an argument
+        # Run the specific function passed as an argument (e.g. the exact_extract pass).
         # **kwargs passes things like shp_path automatically
+        t1 = time.perf_counter()
         result_df = func(subset, **kwargs)
+        extract_s = time.perf_counter() - t1
+
+        total_compute += compute_s
+        total_extract += extract_s
+        print(f"--- Processing {batch_years[0]} to {batch_years[-1]} --- "
+              f"| compute {compute_s:.1f}s | extract {extract_s:.1f}s "
+              f"| total {compute_s + extract_s:.1f}s")
 
         all_results.append(result_df)
+
+    print(f"Total: compute {total_compute:.1f}s | extract {total_extract:.1f}s "
+          f"| wall {total_compute + total_extract:.1f}s")
 
     return pd.concat(all_results, ignore_index=True)
 
@@ -417,7 +627,6 @@ def extract_dly_hydrologic_properties(ds, events_df, shp):
     evs_prop = pd.merge(relevant_events, df_final, on=['GAGE_ID', 'Date'], how='inner')
 
     return evs_prop
-
 
 def _build_coverage_weights(template_2d, basins, id_col='GAGE_ID'):
     """
